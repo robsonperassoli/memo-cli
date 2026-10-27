@@ -1,0 +1,15 @@
+[package]
+name = "memo-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Shared agent memory stored in SQLite"
+license = "MIT"
+repository = "https://github.com/robsonperassoli/memo-cli"
+publish = false
+
+[[bin]]
+name = "memo"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,10 @@
+# Documentation
+
+Index of `memo` docs. These pages describe what each document will cover. The tool does not implement storage or commands yet.
+
+- [Getting started](getting-started.md) — install the `memo` binary and choose a SQLite database.
+- [Commands](commands.md) — subcommands, flags, and exit behavior.
+- [Query syntax](query-syntax.md) — how to search shared agent memory.
+- [Data model](data-model.md) — SQLite tables and how records relate.
+- [Skill](skill.md) — how a coding agent should call `memo`.
+- [Releasing](releasing.md) — version bump, tag, and publish.
