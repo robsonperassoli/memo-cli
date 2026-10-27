@@ -1,10 +1,8 @@
 # Documentation
 
-Index of `memo` docs. Storage is described in the data model. Command behavior is in [Commands](commands.md).
-
-- [Getting started](getting-started.md) — install the `memo` binary and choose a SQLite database.
-- [Commands](commands.md) — subcommands, flags, and exit behavior.
-- [Query syntax](query-syntax.md) — how to search shared agent memory.
-- [Data model](data-model.md) — SQLite tables and how records relate.
-- [Skill](skill.md) — how a coding agent should call `memo`.
+- [Getting started](getting-started.md) — install from a release or from source, then a short end-to-end walkthrough.
+- [Commands](commands.md) — every command and flag, input modes, JSON shapes, exit codes, and examples.
+- [Query syntax](query-syntax.md) — search syntax and read-only SQL (`memories`, `memories_fts`, row cap, timeout).
+- [Data model](data-model.md) — database path (`MEMO_DB`, `XDG_DATA_HOME`), scopes and the global scope, and the `memories` view.
+- [Skill](skill.md) — install `skill/SKILL.md` for a coding agent.
 - [Releasing](releasing.md) — bump the version, push a `v*` tag, and publish the GitHub Release.
