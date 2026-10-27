@@ -116,6 +116,8 @@ pub struct ReadOptions {
     pub kind: Option<MemoryKind>,
     pub tag: Option<String>,
     pub include_expired: bool,
+    /// Maximum rows returned by [`Store::list`]. `None` means no limit.
+    pub limit: Option<u32>,
 }
 
 /// One stored memory, including its tags.
@@ -258,7 +260,8 @@ impl Store {
                         WHERE mt.memory_id = m.id AND t.name = ?5
                     )
                   )
-            ORDER BY m.id
+            ORDER BY m.created_at DESC, m.id DESC
+            LIMIT ?6
         ";
         self.collect_memories(sql, options, None)
     }
@@ -422,8 +425,9 @@ impl Store {
             )?
             .collect::<std::result::Result<Vec<i64>, _>>()?
         } else {
+            let limit = options.limit.map_or(-1, i64::from);
             stmt.query_map(
-                params![options.include_expired, now, scope, kind, tag],
+                params![options.include_expired, now, scope, kind, tag, limit],
                 |row| row.get(0),
             )?
             .collect::<std::result::Result<Vec<i64>, _>>()?
@@ -969,6 +973,25 @@ mod tests {
             store.get(first.memory.id).unwrap().unwrap().content,
             "alpha"
         );
+    }
+
+    #[test]
+    fn list_returns_newest_first_and_respects_limit() {
+        let (_dir, mut store) = open_temp();
+        let older = store.insert(&new_content("older-row")).unwrap();
+        let newer = store.insert(&new_content("newer-row")).unwrap();
+        let rows = store.list(&ReadOptions::default()).unwrap();
+        assert_eq!(rows[0].id, newer.memory.id);
+        assert_eq!(rows[1].id, older.memory.id);
+
+        let limited = store
+            .list(&ReadOptions {
+                limit: Some(1),
+                ..ReadOptions::default()
+            })
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, newer.memory.id);
     }
 
     #[test]

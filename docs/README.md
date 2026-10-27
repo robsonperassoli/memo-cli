@@ -1,6 +1,6 @@
 # Documentation
 
-Index of `memo` docs. Storage is described in the data model. Subcommands are not implemented yet.
+Index of `memo` docs. Storage is described in the data model. Command behavior is in [Commands](commands.md).
 
 - [Getting started](getting-started.md) — install the `memo` binary.
 - [Commands](commands.md) — subcommands, flags, and exit behavior.

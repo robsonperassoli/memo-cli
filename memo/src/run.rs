@@ -1,0 +1,581 @@
+use std::fs;
+use std::io::{self, IsTerminal, Read};
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, NaiveDate};
+use clap::{Parser, Subcommand, ValueEnum};
+use memo::{Memory, MemoryKind, MemoryUpdate, NewMemory, Patch, ReadOptions, Store};
+use serde_json::{json, Value};
+
+/// Shared agent memory stored in SQLite.
+#[derive(Parser)]
+#[command(name = "memo", version, about, propagate_version = true)]
+struct Cli {
+    /// SQLite database path. Overrides `MEMO_DB`.
+    ///
+    /// When omitted, memo uses `$XDG_DATA_HOME/memo/memo.db`, or
+    /// `~/.local/share/memo/memo.db` if `XDG_DATA_HOME` is unset.
+    #[arg(long, global = true, value_name = "PATH")]
+    db: Option<PathBuf>,
+
+    /// Print JSON instead of text.
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Store a memory.
+    Add {
+        /// Memory body. Use `-` to read stdin.
+        ///
+        /// Markdown is stored unchanged. When this argument and `--file` are
+        /// both omitted, a pipe is read as the body.
+        #[arg(value_name = "CONTENT", conflicts_with = "file")]
+        content: Option<String>,
+
+        /// Read the memory body from a file.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+
+        /// Optional title.
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+
+        /// Memory kind. Defaults to `note`.
+        #[arg(long, value_enum, value_name = "KIND")]
+        kind: Option<KindArg>,
+
+        /// Scope. Defaults to `global`.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+
+        /// Comma-separated tags.
+        #[arg(long, value_name = "TAGS")]
+        tags: Option<String>,
+
+        /// Name recorded as `source_agent`.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+
+        /// Expiry as `YYYY-MM-DD` or an RFC 3339 timestamp.
+        #[arg(long, value_name = "DATE")]
+        expires: Option<String>,
+    },
+
+    /// Print one memory.
+    Get {
+        /// Memory id.
+        id: i64,
+    },
+
+    /// Change a memory. `updated_at` is refreshed and the full-text index is updated.
+    Update {
+        /// Memory id.
+        id: i64,
+
+        /// Replacement body. Use `-` to read stdin.
+        #[arg(long, value_name = "CONTENT", conflicts_with = "file")]
+        content: Option<String>,
+
+        /// Read the replacement body from a file.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+
+        /// Replacement title. An empty value clears it.
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+
+        /// Replacement kind.
+        #[arg(long, value_enum, value_name = "KIND")]
+        kind: Option<KindArg>,
+
+        /// Replacement scope.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+
+        /// Tag to add. May be repeated.
+        #[arg(long = "add-tag", value_name = "TAG")]
+        add_tag: Vec<String>,
+
+        /// Tag to remove. May be repeated.
+        #[arg(long = "remove-tag", value_name = "TAG")]
+        remove_tag: Vec<String>,
+
+        /// Replacement expiry (`YYYY-MM-DD` or RFC 3339).
+        #[arg(long, value_name = "DATE")]
+        expires: Option<String>,
+    },
+
+    /// Delete a memory.
+    Forget {
+        /// Memory id.
+        id: i64,
+    },
+
+    /// List memories, newest first.
+    List {
+        /// Only memories with this tag.
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+
+        /// Only memories in this scope.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+
+        /// Only memories of this kind.
+        #[arg(long, value_enum, value_name = "KIND")]
+        kind: Option<KindArg>,
+
+        /// Maximum number of rows.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum KindArg {
+    Fact,
+    Decision,
+    Note,
+}
+
+impl From<KindArg> for MemoryKind {
+    fn from(value: KindArg) -> Self {
+        match value {
+            KindArg::Fact => Self::Fact,
+            KindArg::Decision => Self::Decision,
+            KindArg::Note => Self::Note,
+        }
+    }
+}
+
+pub fn run() -> Result<(), String> {
+    let cli = Cli::parse();
+    let mut store = open_store(cli.db.as_deref())?;
+    match cli.command {
+        Command::Add {
+            content,
+            file,
+            title,
+            kind,
+            scope,
+            tags,
+            agent,
+            expires,
+        } => cmd_add(
+            &mut store,
+            cli.json,
+            AddInput {
+                content,
+                file,
+                title,
+                kind,
+                scope,
+                tags,
+                agent,
+                expires,
+            },
+        ),
+        Command::Get { id } => cmd_get(&store, cli.json, id),
+        Command::Update {
+            id,
+            content,
+            file,
+            title,
+            kind,
+            scope,
+            add_tag,
+            remove_tag,
+            expires,
+        } => cmd_update(
+            &mut store,
+            cli.json,
+            UpdateInput {
+                id,
+                content,
+                file,
+                title,
+                kind,
+                scope,
+                add_tag,
+                remove_tag,
+                expires,
+            },
+        ),
+        Command::Forget { id } => cmd_forget(&mut store, cli.json, id),
+        Command::List {
+            tag,
+            scope,
+            kind,
+            limit,
+        } => cmd_list(&store, cli.json, tag, scope, kind, limit),
+    }
+}
+
+struct AddInput {
+    content: Option<String>,
+    file: Option<PathBuf>,
+    title: Option<String>,
+    kind: Option<KindArg>,
+    scope: Option<String>,
+    tags: Option<String>,
+    agent: Option<String>,
+    expires: Option<String>,
+}
+
+struct UpdateInput {
+    id: i64,
+    content: Option<String>,
+    file: Option<PathBuf>,
+    title: Option<String>,
+    kind: Option<KindArg>,
+    scope: Option<String>,
+    add_tag: Vec<String>,
+    remove_tag: Vec<String>,
+    expires: Option<String>,
+}
+
+fn cmd_add(store: &mut Store, json_output: bool, input: AddInput) -> Result<(), String> {
+    let body = read_body(input.content.as_deref(), input.file.as_deref(), true)?;
+    let expires_at = input.expires.as_deref().map(parse_expires).transpose()?;
+    let inserted = store
+        .insert(&NewMemory {
+            title: input.title,
+            content: body,
+            kind: input.kind.map(MemoryKind::from).unwrap_or_default(),
+            scope: input.scope.unwrap_or_else(|| "global".to_owned()),
+            source_agent: input.agent,
+            tags: input.tags.as_deref().map(split_tags).unwrap_or_default(),
+            expires_at,
+        })
+        .map_err(store_err)?;
+    if json_output {
+        let mut value = memory_json(&inserted.memory);
+        value["deduplicated"] = Value::Bool(!inserted.created);
+        print_json(&value)
+    } else if inserted.created {
+        println!("added {}", inserted.memory.id);
+        Ok(())
+    } else {
+        println!("deduplicated {}", inserted.memory.id);
+        Ok(())
+    }
+}
+
+fn cmd_get(store: &Store, json_output: bool, id: i64) -> Result<(), String> {
+    let memory = load_visible(store, id)?;
+    emit_memory(json_output, &memory)
+}
+
+fn cmd_update(store: &mut Store, json_output: bool, input: UpdateInput) -> Result<(), String> {
+    if input.content.is_none()
+        && input.file.is_none()
+        && input.title.is_none()
+        && input.kind.is_none()
+        && input.scope.is_none()
+        && input.add_tag.is_empty()
+        && input.remove_tag.is_empty()
+        && input.expires.is_none()
+    {
+        return Err("memo: nothing to update".to_owned());
+    }
+    let current = load_any(store, input.id)?;
+    let new_content = if input.content.is_some() || input.file.is_some() {
+        Some(read_body(
+            input.content.as_deref(),
+            input.file.as_deref(),
+            false,
+        )?)
+    } else {
+        None
+    };
+    let tags = if input.add_tag.is_empty() && input.remove_tag.is_empty() {
+        None
+    } else {
+        Some(edit_tags(&current.tags, &input.remove_tag, &input.add_tag))
+    };
+    let expires_at = match input.expires.as_deref() {
+        Some(value) => Patch::Set(parse_expires(value)?),
+        None => Patch::Unchanged,
+    };
+    let updated = store
+        .update(
+            input.id,
+            &MemoryUpdate {
+                title: match input.title {
+                    Some(value) => Patch::Set(value),
+                    None => Patch::Unchanged,
+                },
+                content: new_content,
+                kind: input.kind.map(MemoryKind::from),
+                scope: input.scope,
+                expires_at,
+                tags,
+                ..MemoryUpdate::default()
+            },
+        )
+        .map_err(store_err)?
+        .ok_or_else(|| missing(input.id))?;
+    if json_output {
+        print_json(&memory_json(&updated))
+    } else {
+        println!("updated {}", updated.id);
+        Ok(())
+    }
+}
+
+fn cmd_forget(store: &mut Store, json_output: bool, id: i64) -> Result<(), String> {
+    let memory = load_any(store, id)?;
+    if !store.delete(id).map_err(store_err)? {
+        return Err(missing(id));
+    }
+    if json_output {
+        print_json(&memory_json(&memory))
+    } else {
+        println!("forgot {id}");
+        Ok(())
+    }
+}
+
+fn cmd_list(
+    store: &Store,
+    json_output: bool,
+    tag: Option<String>,
+    scope: Option<String>,
+    kind: Option<KindArg>,
+    limit: Option<u32>,
+) -> Result<(), String> {
+    let tag = tag
+        .as_deref()
+        .map(|value| non_empty("tag", value))
+        .transpose()?;
+    let scope = scope
+        .as_deref()
+        .map(|value| non_empty("scope", value))
+        .transpose()?;
+    let memories = store
+        .list(&ReadOptions {
+            scope,
+            kind: kind.map(MemoryKind::from),
+            tag,
+            include_expired: false,
+            limit,
+        })
+        .map_err(store_err)?;
+    if json_output {
+        let values: Vec<Value> = memories.iter().map(memory_json).collect();
+        print_json(&Value::Array(values))
+    } else {
+        for memory in &memories {
+            println!(
+                "{}  {}  {}  {}",
+                memory.id,
+                memory.kind,
+                memory.scope,
+                preview(memory)
+            );
+        }
+        Ok(())
+    }
+}
+
+fn open_store(db: Option<&Path>) -> Result<Store, String> {
+    let path = memo::resolve_db_path(db).map_err(store_err)?;
+    Store::open(path).map_err(store_err)
+}
+
+fn load_visible(store: &Store, id: i64) -> Result<Memory, String> {
+    store.get(id).map_err(store_err)?.ok_or_else(|| missing(id))
+}
+
+fn load_any(store: &Store, id: i64) -> Result<Memory, String> {
+    store
+        .get_including_expired(id)
+        .map_err(store_err)?
+        .ok_or_else(|| missing(id))
+}
+
+fn read_body(
+    content: Option<&str>,
+    file: Option<&Path>,
+    implicit_stdin: bool,
+) -> Result<String, String> {
+    if let Some(path) = file {
+        return fs::read_to_string(path)
+            .map_err(|err| format!("memo: cannot read {}: {err}", path.display()));
+    }
+    match content {
+        Some("-") => read_stdin(),
+        Some(text) => Ok(text.to_owned()),
+        None if implicit_stdin && !io::stdin().is_terminal() => read_stdin(),
+        None => Err("memo: content is required (argument, stdin, or --file)".to_owned()),
+    }
+}
+
+fn read_stdin() -> Result<String, String> {
+    let mut buf = String::new();
+    io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|err| format!("memo: cannot read stdin: {err}"))?;
+    Ok(buf)
+}
+
+fn parse_expires(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if DateTime::parse_from_rfc3339(trimmed).is_ok() {
+        return Ok(trimmed.to_owned());
+    }
+    if NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_ok() {
+        return Ok(format!("{trimmed}T00:00:00Z"));
+    }
+    Err(format!("memo: invalid timestamp: {value}"))
+}
+
+fn split_tags(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn edit_tags(current: &[String], remove: &[String], add: &[String]) -> Vec<String> {
+    let remove: Vec<String> = remove.iter().map(|tag| tag.trim().to_owned()).collect();
+    let mut tags: Vec<String> = current
+        .iter()
+        .filter(|tag| !remove.iter().any(|gone| gone == *tag))
+        .cloned()
+        .collect();
+    for tag in add {
+        let tag = tag.trim();
+        if tag.is_empty() || tags.iter().any(|existing| existing == tag) {
+            continue;
+        }
+        tags.push(tag.to_owned());
+    }
+    tags
+}
+
+fn non_empty(label: &str, value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("memo: {label} must not be empty"))
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+fn preview(memory: &Memory) -> String {
+    let source = memory.title.as_deref().unwrap_or(memory.content.as_str());
+    let line = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 72;
+    if line.chars().count() <= MAX {
+        line
+    } else {
+        let mut truncated: String = line.chars().take(MAX - 3).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+fn memory_json(memory: &Memory) -> Value {
+    json!({
+        "id": memory.id,
+        "scope": memory.scope,
+        "kind": memory.kind.as_str(),
+        "title": memory.title,
+        "content": memory.content,
+        "tags": memory.tags,
+        "source_agent": memory.source_agent,
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+        "expires_at": memory.expires_at,
+    })
+}
+
+fn emit_memory(json_output: bool, memory: &Memory) -> Result<(), String> {
+    if json_output {
+        return print_json(&memory_json(memory));
+    }
+    println!("id: {}", memory.id);
+    println!("scope: {}", memory.scope);
+    println!("kind: {}", memory.kind);
+    println!("title: {}", display_optional(memory.title.as_deref()));
+    println!(
+        "tags: {}",
+        if memory.tags.is_empty() {
+            "-".to_owned()
+        } else {
+            memory.tags.join(", ")
+        }
+    );
+    println!(
+        "source_agent: {}",
+        display_optional(memory.source_agent.as_deref())
+    );
+    println!("created_at: {}", memory.created_at);
+    println!("updated_at: {}", memory.updated_at);
+    println!(
+        "expires_at: {}",
+        display_optional(memory.expires_at.as_deref())
+    );
+    println!();
+    if memory.content.ends_with('\n') {
+        print!("{}", memory.content);
+    } else {
+        println!("{}", memory.content);
+    }
+    Ok(())
+}
+
+fn display_optional(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+fn print_json(value: &Value) -> Result<(), String> {
+    let line = serde_json::to_string(value).map_err(|err| format!("memo: {err}"))?;
+    println!("{line}");
+    Ok(())
+}
+
+fn missing(id: i64) -> String {
+    format!("memo: memory {id} not found")
+}
+
+fn store_err(err: impl std::fmt::Display) -> String {
+    format!("memo: {err}")
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn version_help_db_json_and_commands_are_present() {
+        let mut command = Cli::command();
+        command.build();
+
+        assert!(command.get_version().is_some());
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .collect();
+        assert!(longs.contains(&"help"));
+        assert!(longs.contains(&"db"));
+        assert!(longs.contains(&"json"));
+
+        let names: Vec<_> = command
+            .get_subcommands()
+            .map(|cmd| cmd.get_name())
+            .collect();
+        for name in ["add", "get", "update", "forget", "list"] {
+            assert!(names.contains(&name), "{names:?}");
+        }
+    }
+}
