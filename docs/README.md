@@ -1,8 +1,8 @@
 # Documentation
 
-Index of `memo` docs. These pages describe what each document will cover. The tool does not implement storage or commands yet.
+Index of `memo` docs. Storage is described in the data model. Command behavior is in [Commands](commands.md).
 
-- [Getting started](getting-started.md) — install the `memo` binary.
+- [Getting started](getting-started.md) — install the `memo` binary and choose a SQLite database.
 - [Commands](commands.md) — subcommands, flags, and exit behavior.
 - [Query syntax](query-syntax.md) — how to search shared agent memory.
 - [Data model](data-model.md) — SQLite tables and how records relate.

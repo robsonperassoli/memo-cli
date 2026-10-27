@@ -1,8 +1,8 @@
 # memo-cli
 
-`memo` is a Rust command-line tool that will store shared agent memory in SQLite.
+`memo` is a Rust command-line tool that stores shared agent memory in SQLite.
 
-This repository is scaffolding. The binary accepts `--help` and `--version` only. Storage, subcommands, and query syntax are not implemented.
+`memo add`, `get`, `update`, `forget`, `list`, `search`, `scopes`, `schema`, and `sql` read and write the database. Paths, schema, and storage rules are in [docs/data-model.md](docs/data-model.md). Commands are in [docs/commands.md](docs/commands.md).
 
 ## Install
 
