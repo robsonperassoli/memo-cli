@@ -3,7 +3,7 @@
 Global flags:
 
 - `--db PATH` selects the database file and overrides `MEMO_DB`. The default path is in [Data model](data-model.md). The file is created on first use.
-- `--json` prints JSON instead of text. A memory object has `id`, `scope`, `kind`, `title`, `content`, `tags`, `source_agent`, `created_at`, `updated_at`, and `expires_at`. `memo list --json` prints an array of those objects. `memo add --json` also includes `deduplicated`. `memo search --json` adds `rank` and `snippet`. `memo scopes --json` prints `scope`, `count`, and `last_updated`.
+- `--json` prints JSON instead of text. A memory object has `id`, `scope`, `kind`, `title`, `content`, `tags`, `source_agent`, `created_at`, `updated_at`, and `expires_at`. `memo list --json` prints an array of those objects. `memo add --json` also includes `deduplicated`. `memo search --json` adds `rank` and `snippet`. `memo scopes --json` prints `scope`, `count`, and `last_updated`. `memo schema --json` prints `name`, `type`, `description`, and `columns`. `memo sql --json` prints an array of row objects.
 
 Errors are written to stderr and the process exits non-zero. An unknown id is an error. Invalid arguments exit with clap's usage error.
 
@@ -56,3 +56,19 @@ Each text line is the id, kind, scope, and a snippet. JSON rows are memory objec
 `memo scopes`
 
 Prints each scope, how many unexpired memories it contains, and the latest `updated_at`. `global` is always listed. JSON is an array of `scope`, `count`, and `last_updated` (`null` when the scope has no unexpired memories).
+
+## memo schema
+
+`memo schema`
+
+Lists the queryable objects: the `memories` view and the `memories_fts` table. Each column has a short description. See [Data model](data-model.md).
+
+## memo sql
+
+`memo sql "<query>" [--max-rows N]`
+
+Runs one read-only statement. The connection is opened with `SQLITE_OPEN_READ_ONLY` and `PRAGMA query_only`. `INSERT`, `UPDATE`, `DELETE`, `DROP`, and `ATTACH` fail with `SQL access is read-only`.
+
+Text output is a table. JSON output is an array of objects keyed by column name. The default cap is 1000 rows. A cap that leaves rows unread prints `results truncated to N rows` on stderr and still exits 0. A query that runs longer than 5 seconds is cancelled.
+
+`memories.tags` is a JSON array in a text column. The view includes expired rows. `memories_fts` supports `MATCH`; join its `rowid` to `memories.id`.

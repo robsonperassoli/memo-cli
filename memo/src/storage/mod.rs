@@ -8,6 +8,7 @@ mod markdown;
 mod migrate;
 mod path;
 mod query;
+mod sql;
 
 pub use query::compile_fts_query;
 
@@ -21,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 pub use migrate::SCHEMA_VERSION;
 pub use path::resolve_db_path;
+pub use sql::{query_readonly, SchemaColumn, SchemaObject, SqlCell, SqlTable, SQL_ROW_CAP};
 
 use crate::error::{Error, Result};
 use markdown::indexed_text;
@@ -280,7 +282,7 @@ impl Store {
     pub fn list(&self, options: &ReadOptions) -> Result<Vec<Memory>> {
         let sql = "
             SELECT m.id
-            FROM memories m
+            FROM memory_rows m
             WHERE (?1 OR m.expires_at IS NULL OR m.expires_at > ?2)
               AND (?3 IS NULL OR m.scope = ?3)
               AND (?4 IS NULL OR m.kind = ?4)
@@ -320,7 +322,7 @@ impl Store {
                    bm25(memories_fts),
                    snippet(memories_fts, -1, '', '', '...', 12)
             FROM memories_fts
-            JOIN memories m ON m.id = memories_fts.rowid
+            JOIN memory_rows m ON m.id = memories_fts.rowid
             WHERE memories_fts MATCH ?1
               AND (?2 OR m.expires_at IS NULL OR m.expires_at > ?3)
               AND (
@@ -392,7 +394,7 @@ impl Store {
         let now = now_utc();
         let mut stmt = self.conn.prepare(
             "SELECT scope, COUNT(*), MAX(updated_at)
-             FROM memories
+             FROM memory_rows
              WHERE expires_at IS NULL OR expires_at > ?1
              GROUP BY scope",
         )?;
@@ -415,6 +417,11 @@ impl Store {
         }
         rows.sort_by(|left, right| scope_list_order(&left.scope, &right.scope));
         Ok(rows)
+    }
+
+    /// Documented objects for `memo schema` and `memo sql`.
+    pub fn schema(&self) -> Result<Vec<SchemaObject>> {
+        sql::read_schema(&self.conn)
     }
 
     /// Update any memory. `source_agent` is not an access check.
@@ -460,7 +467,7 @@ impl Store {
         if hash != current.content_hash || scope != current.scope {
             let conflict: Option<i64> = tx
                 .query_row(
-                    "SELECT id FROM memories
+                    "SELECT id FROM memory_rows
                      WHERE scope = ?1 AND content_hash = ?2 AND id != ?3",
                     params![scope, hash, id],
                     |row| row.get(0),
@@ -472,7 +479,7 @@ impl Store {
         }
         let now = now_utc();
         tx.execute(
-            "UPDATE memories
+            "UPDATE memory_rows
              SET title = ?1,
                  content = ?2,
                  kind = ?3,
@@ -515,7 +522,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: Option<i64> = tx
-            .query_row("SELECT id FROM memories WHERE id = ?1", [id], |row| {
+            .query_row("SELECT id FROM memory_rows WHERE id = ?1", [id], |row| {
                 row.get(0)
             })
             .optional()?;
@@ -523,7 +530,7 @@ impl Store {
             return Ok(false);
         }
         delete_fts(&tx, id)?;
-        tx.execute("DELETE FROM memories WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM memory_rows WHERE id = ?1", [id])?;
         delete_orphan_tags(&tx)?;
         tx.commit()?;
         Ok(true)
@@ -569,10 +576,14 @@ fn open_connection(path: &Path) -> Result<Connection> {
     let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
     loop {
         match Connection::open(path) {
-            Ok(conn) => {
-                configure(&conn)?;
-                return Ok(conn);
-            }
+            Ok(conn) => match configure(&conn) {
+                Ok(()) => return Ok(conn),
+                Err(err) if is_locked_error(&err) && std::time::Instant::now() < deadline => {
+                    drop(conn);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err),
+            },
             Err(err) if is_locked(&err) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -595,7 +606,7 @@ fn configure(conn: &Connection) -> Result<()> {
 fn insert_row(tx: &Transaction<'_>, prepared: &PreparedMemory) -> Result<Memory> {
     let now = now_utc();
     tx.execute(
-        "INSERT INTO memories (
+        "INSERT INTO memory_rows (
             title, content, kind, scope, source_agent, created_at, updated_at, expires_at, content_hash
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
@@ -625,7 +636,7 @@ fn insert_row(tx: &Transaction<'_>, prepared: &PreparedMemory) -> Result<Memory>
 fn find_by_hash(conn: &Connection, scope: &str, content_hash: &str) -> Result<Option<Memory>> {
     let id: Option<i64> = conn
         .query_row(
-            "SELECT id FROM memories WHERE scope = ?1 AND content_hash = ?2",
+            "SELECT id FROM memory_rows WHERE scope = ?1 AND content_hash = ?2",
             params![scope, content_hash],
             |row| row.get(0),
         )
@@ -642,7 +653,7 @@ fn load_memory(conn: &Connection, id: i64, include_expired: bool) -> Result<Opti
         .query_row(
             "SELECT id, title, content, kind, scope, source_agent, created_at, updated_at,
                     expires_at, content_hash
-             FROM memories
+             FROM memory_rows
              WHERE id = ?1
                AND (?2 OR expires_at IS NULL OR expires_at > ?3)",
             params![id, include_expired, now],
@@ -868,6 +879,13 @@ fn is_locked(err: &rusqlite::Error) -> bool {
     )
 }
 
+fn is_locked_error(err: &Error) -> bool {
+    match err {
+        Error::Sqlite(err) => is_locked(err),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,9 +932,17 @@ mod tests {
         assert_eq!(busy, 5000);
 
         let names = table_names(&store);
-        for required in ["memories", "tags", "memory_tags", "memories_fts"] {
+        for required in [
+            "memories",
+            "memory_rows",
+            "tags",
+            "memory_tags",
+            "memories_fts",
+        ] {
             assert!(names.iter().any(|name| name == required), "{names:?}");
         }
+        assert_eq!(object_type(&store, "memories"), "view");
+        assert_eq!(object_type(&store, "memory_rows"), "table");
         assert!(!names.iter().any(|name| name == "embeddings"));
 
         let err = store
@@ -945,10 +971,10 @@ mod tests {
             let inserted = store.insert(&new_content("kept across reopen")).unwrap();
             assert!(inserted.created);
             memory_id = inserted.memory.id;
-            assert_eq!(store.schema_version().unwrap(), 1);
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let loaded = store.get(memory_id).unwrap().unwrap();
         assert_eq!(loaded.content, "kept across reopen");
         assert_eq!(
@@ -1248,6 +1274,65 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("global", 1), ("other", 1), ("project", 1)]
         );
+    }
+
+    #[test]
+    fn memories_view_upgrades_from_v1_and_hides_the_storage_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memo.db");
+        migrate::create_v1_database(&path).unwrap();
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(object_type(&store, "memories"), "view");
+        assert_eq!(object_type(&store, "memory_rows"), "table");
+
+        let (content, tags, updated_at): (String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT content, tags, updated_at FROM memories WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(content, "migrated body");
+        assert_eq!(tags, r#"["alpha","zeta"]"#);
+        assert_eq!(updated_at, "2020-01-02T00:00:00.000Z");
+
+        let missing = store
+            .conn
+            .query_row("SELECT content_hash FROM memories", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap_err();
+        assert!(missing.to_string().contains("content_hash"), "{missing}");
+
+        let untagged = store
+            .insert(&NewMemory {
+                content: "no tags here".to_owned(),
+                ..NewMemory::default()
+            })
+            .unwrap();
+        let tags: String = store
+            .conn
+            .query_row(
+                "SELECT tags FROM memories WHERE id = ?1",
+                [untagged.memory.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, "[]");
+    }
+
+    fn object_type(store: &Store, name: &str) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn table_names(store: &Store) -> Vec<String> {

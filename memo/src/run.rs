@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
 use memo::{
-    compile_fts_query, Memory, MemoryKind, MemoryUpdate, NewMemory, Patch, ReadOptions, ScopeQuery,
-    SearchHit, Store,
+    compile_fts_query, query_readonly, Memory, MemoryKind, MemoryUpdate, NewMemory, Patch,
+    ReadOptions, SchemaObject, ScopeQuery, SearchHit, SqlCell, SqlTable, Store, SQL_ROW_CAP,
 };
 use serde_json::{json, Value};
 
@@ -175,6 +175,20 @@ enum Command {
 
     /// List scopes with unexpired memory counts.
     Scopes,
+
+    /// Show the queryable views and tables.
+    Schema,
+
+    /// Run one read-only SQL statement.
+    Sql {
+        /// SQL statement. Writes are rejected.
+        #[arg(value_name = "QUERY")]
+        query: String,
+
+        /// Maximum number of rows. Defaults to 1000.
+        #[arg(long = "max-rows", value_name = "N")]
+        max_rows: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -278,6 +292,8 @@ pub fn run() -> Result<(), String> {
             },
         ),
         Command::Scopes => cmd_scopes(&store, cli.json),
+        Command::Schema => cmd_schema(&store, cli.json),
+        Command::Sql { query, max_rows } => cmd_sql(cli.db.as_deref(), cli.json, query, max_rows),
     }
 }
 
@@ -633,6 +649,142 @@ fn search_json(hit: &SearchHit) -> Value {
     value
 }
 
+fn cmd_schema(store: &Store, json_output: bool) -> Result<(), String> {
+    let objects = store.schema().map_err(store_err)?;
+    if json_output {
+        let values: Vec<Value> = objects.iter().map(schema_json).collect();
+        return print_json(&Value::Array(values));
+    }
+    for (index, object) in objects.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!("{} ({})", object.name, object.kind);
+        println!("{}", object.description);
+        let width = object
+            .columns
+            .iter()
+            .map(|column| column.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for column in &object.columns {
+            println!(
+                "  {:width$}  {}",
+                column.name,
+                column.description,
+                width = width
+            );
+        }
+    }
+    Ok(())
+}
+
+fn schema_json(object: &SchemaObject) -> Value {
+    json!({
+        "name": object.name,
+        "type": object.kind,
+        "description": object.description,
+        "columns": object.columns.iter().map(|column| json!({
+            "name": column.name,
+            "type": column.type_name,
+            "description": column.description,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn cmd_sql(
+    db: Option<&Path>,
+    json_output: bool,
+    query: String,
+    max_rows: Option<u32>,
+) -> Result<(), String> {
+    let path = memo::resolve_db_path(db).map_err(store_err)?;
+    let max_rows = max_rows.unwrap_or(SQL_ROW_CAP);
+    let table = query_readonly(&path, &query, max_rows).map_err(store_err)?;
+    if json_output {
+        print_json(&sql_json(&table))?;
+    } else {
+        print_sql_table(&table);
+    }
+    if table.truncated {
+        eprintln!("memo: results truncated to {max_rows} rows");
+    }
+    Ok(())
+}
+
+fn sql_json(table: &SqlTable) -> Value {
+    Value::Array(
+        table
+            .rows
+            .iter()
+            .map(|row| {
+                let mut object = serde_json::Map::new();
+                for (column, cell) in table.columns.iter().zip(row) {
+                    object.insert(column.clone(), sql_cell_json(cell));
+                }
+                Value::Object(object)
+            })
+            .collect(),
+    )
+}
+
+fn sql_cell_json(cell: &SqlCell) -> Value {
+    match cell {
+        SqlCell::Null => Value::Null,
+        SqlCell::Integer(value) => Value::from(*value),
+        SqlCell::Real(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        SqlCell::Text(value) => Value::String(value.clone()),
+        SqlCell::Blob(value) => Value::Array(value.iter().copied().map(Value::from).collect()),
+    }
+}
+
+fn print_sql_table(table: &SqlTable) {
+    let rendered: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .map(|row| row.iter().map(display_cell).collect())
+        .collect();
+    let mut widths: Vec<usize> = table
+        .columns
+        .iter()
+        .map(|column| column.chars().count())
+        .collect();
+    for row in &rendered {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    print_aligned(&table.columns, &widths);
+    for row in &rendered {
+        print_aligned(row, &widths);
+    }
+}
+
+fn print_aligned(cells: &[impl AsRef<str>], widths: &[usize]) {
+    let line = cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| {
+            let width = widths.get(index).copied().unwrap_or(0);
+            format!("{:width$}", cell.as_ref(), width = width)
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("{line}");
+}
+
+fn display_cell(cell: &SqlCell) -> String {
+    match cell {
+        SqlCell::Null => String::new(),
+        SqlCell::Integer(value) => value.to_string(),
+        SqlCell::Real(value) => value.to_string(),
+        SqlCell::Text(value) => value.split_whitespace().collect::<Vec<_>>().join(" "),
+        SqlCell::Blob(value) => format!("<{} bytes>", value.len()),
+    }
+}
+
 fn open_store(db: Option<&Path>) -> Result<Store, String> {
     let path = memo::resolve_db_path(db).map_err(store_err)?;
     Store::open(path).map_err(store_err)
@@ -824,7 +976,9 @@ mod tests {
             .get_subcommands()
             .map(|cmd| cmd.get_name())
             .collect();
-        for name in ["add", "get", "update", "forget", "list", "search", "scopes"] {
+        for name in [
+            "add", "get", "update", "forget", "list", "search", "scopes", "schema", "sql",
+        ] {
             assert!(names.contains(&name), "{names:?}");
         }
     }

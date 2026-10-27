@@ -2,7 +2,7 @@
 
 `memo` is a Rust command-line tool that stores shared agent memory in SQLite.
 
-`memo add`, `get`, `update`, `forget`, `list`, `search`, and `scopes` read and write the database. Paths, schema, and storage rules are in [docs/data-model.md](docs/data-model.md). Commands are in [docs/commands.md](docs/commands.md).
+`memo add`, `get`, `update`, `forget`, `list`, `search`, `scopes`, `schema`, and `sql` read and write the database. Paths, schema, and storage rules are in [docs/data-model.md](docs/data-model.md). Commands are in [docs/commands.md](docs/commands.md).
 
 ## Install
 

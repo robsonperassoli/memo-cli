@@ -24,6 +24,11 @@ pub enum Error {
     WalUnavailable(String),
     /// The FTS5 query or a search term is not usable.
     InvalidSearch(String),
+    EmptySql,
+    /// `memo sql` refused a statement that would change a database.
+    ReadOnlySql,
+    /// A read-only query ran longer than the progress-handler limit.
+    SqlTimeout,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -53,6 +58,9 @@ impl fmt::Display for Error {
                 write!(f, "could not enable WAL journal mode (got {mode})")
             }
             Self::InvalidSearch(message) => write!(f, "invalid search query: {message}"),
+            Self::EmptySql => write!(f, "SQL query must not be empty"),
+            Self::ReadOnlySql => write!(f, "SQL access is read-only"),
+            Self::SqlTimeout => write!(f, "query exceeded the 5s time limit"),
         }
     }
 }
