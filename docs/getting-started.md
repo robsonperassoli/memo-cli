@@ -16,4 +16,4 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/robsonperassoli/me
 
 The installer puts `memo` in the Cargo bin directory (`$CARGO_HOME/bin`, otherwise `~/.cargo/bin`). Each release also has archives and sha256 checksums.
 
-The shared SQLite database is not implemented yet. `memo --help` and `memo --version` are the only supported commands.
+Database location and overrides are in [Data model](data-model.md). The binary does not create the database until storage is opened. No read or write commands exist yet.

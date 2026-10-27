@@ -1,6 +1,6 @@
 # Documentation
 
-Index of `memo` docs. These pages describe what each document will cover. The tool does not implement storage or commands yet.
+Index of `memo` docs. Storage is described in the data model. Subcommands are not implemented yet.
 
 - [Getting started](getting-started.md) — install the `memo` binary.
 - [Commands](commands.md) — subcommands, flags, and exit behavior.
