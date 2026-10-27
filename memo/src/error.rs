@@ -22,6 +22,8 @@ pub enum Error {
     },
     /// SQLite refused to enable WAL.
     WalUnavailable(String),
+    /// The FTS5 query or a search term is not usable.
+    InvalidSearch(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -50,6 +52,7 @@ impl fmt::Display for Error {
             Self::WalUnavailable(mode) => {
                 write!(f, "could not enable WAL journal mode (got {mode})")
             }
+            Self::InvalidSearch(message) => write!(f, "invalid search query: {message}"),
         }
     }
 }

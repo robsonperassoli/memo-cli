@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
-use memo::{Memory, MemoryKind, MemoryUpdate, NewMemory, Patch, ReadOptions, Store};
+use memo::{
+    compile_fts_query, Memory, MemoryKind, MemoryUpdate, NewMemory, Patch, ReadOptions, ScopeQuery,
+    SearchHit, Store,
+};
 use serde_json::{json, Value};
 
 /// Shared agent memory stored in SQLite.
@@ -134,6 +137,44 @@ enum Command {
         #[arg(long, value_name = "N")]
         limit: Option<u32>,
     },
+
+    /// Search title, content, and tags.
+    Search {
+        /// Keywords or a raw FTS5 query. A trailing `*` is a prefix.
+        #[arg(value_name = "TERM")]
+        terms: Vec<String>,
+
+        /// This scope plus `global`.
+        #[arg(long, value_name = "SCOPE", conflicts_with = "only_scope")]
+        scope: Option<String>,
+
+        /// Only this scope.
+        #[arg(long = "only-scope", value_name = "SCOPE", conflicts_with = "scope")]
+        only_scope: Option<String>,
+
+        /// Combine plain terms with OR instead of AND.
+        #[arg(long)]
+        any: bool,
+
+        /// Rust regular expression matched against title and content.
+        #[arg(long, value_name = "PATTERN")]
+        regex: Option<String>,
+
+        /// Only memories of this kind.
+        #[arg(long, value_enum, value_name = "KIND")]
+        kind: Option<KindArg>,
+
+        /// Only memories with this tag.
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+
+        /// Maximum number of rows.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+
+    /// List scopes with unexpired memory counts.
+    Scopes,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -213,7 +254,42 @@ pub fn run() -> Result<(), String> {
             kind,
             limit,
         } => cmd_list(&store, cli.json, tag, scope, kind, limit),
+        Command::Search {
+            terms,
+            scope,
+            only_scope,
+            any,
+            regex,
+            kind,
+            tag,
+            limit,
+        } => cmd_search(
+            &store,
+            cli.json,
+            SearchInput {
+                terms,
+                scope,
+                only_scope,
+                any,
+                regex,
+                kind,
+                tag,
+                limit,
+            },
+        ),
+        Command::Scopes => cmd_scopes(&store, cli.json),
     }
+}
+
+struct SearchInput {
+    terms: Vec<String>,
+    scope: Option<String>,
+    only_scope: Option<String>,
+    any: bool,
+    regex: Option<String>,
+    kind: Option<KindArg>,
+    tag: Option<String>,
+    limit: Option<u32>,
 }
 
 struct AddInput {
@@ -381,6 +457,180 @@ fn cmd_list(
         }
         Ok(())
     }
+}
+
+fn cmd_search(store: &Store, json_output: bool, input: SearchInput) -> Result<(), String> {
+    if input.terms.is_empty() && input.regex.is_none() {
+        return Err("memo: provide search terms or --regex".to_owned());
+    }
+    let scope = scope_query(input.scope, input.only_scope)?;
+    let pattern = input.regex.as_deref().map(compile_regex).transpose()?;
+    let tag = input
+        .tag
+        .as_deref()
+        .map(|value| non_empty("tag", value))
+        .transpose()?;
+    let defer_limit = pattern.is_some();
+    let options = ReadOptions {
+        scope: None,
+        kind: input.kind.map(MemoryKind::from),
+        tag,
+        include_expired: false,
+        limit: if defer_limit { None } else { input.limit },
+    };
+    let mut hits = if input.terms.is_empty() {
+        regex_only_hits(store, &scope, &options, pattern.as_ref().expect("pattern"))?
+    } else {
+        let query = compile_fts_query(&input.terms, input.any).map_err(store_err)?;
+        let mut found = store.search(&query, &scope, &options).map_err(store_err)?;
+        if let Some(pattern) = &pattern {
+            found.retain(|hit| pattern.is_match(&haystack(&hit.memory)));
+        }
+        found
+    };
+    if defer_limit {
+        if let Some(limit) = input.limit {
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            hits.truncate(limit);
+        }
+    }
+    emit_hits(json_output, &hits)
+}
+
+fn cmd_scopes(store: &Store, json_output: bool) -> Result<(), String> {
+    let scopes = store.scopes().map_err(store_err)?;
+    if json_output {
+        let values: Vec<Value> = scopes
+            .iter()
+            .map(|row| {
+                json!({
+                    "scope": row.scope,
+                    "count": row.count,
+                    "last_updated": row.last_updated,
+                })
+            })
+            .collect();
+        return print_json(&Value::Array(values));
+    }
+    for row in &scopes {
+        println!(
+            "{}  {}  {}",
+            row.scope,
+            row.count,
+            row.last_updated.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
+fn scope_query(scope: Option<String>, only_scope: Option<String>) -> Result<ScopeQuery, String> {
+    match (scope, only_scope) {
+        (Some(value), None) => Ok(ScopeQuery::WithGlobal(non_empty("scope", &value)?)),
+        (None, Some(value)) => Ok(ScopeQuery::Only(non_empty("scope", &value)?)),
+        (None, None) => Ok(ScopeQuery::All),
+        (Some(_), Some(_)) => Err("memo: --scope and --only-scope cannot be combined".to_owned()),
+    }
+}
+
+fn compile_regex(pattern: &str) -> Result<regex::Regex, String> {
+    regex::Regex::new(pattern).map_err(|err| format!("memo: invalid regular expression: {err}"))
+}
+
+fn regex_only_hits(
+    store: &Store,
+    scope: &ScopeQuery,
+    options: &ReadOptions,
+    pattern: &regex::Regex,
+) -> Result<Vec<SearchHit>, String> {
+    let list_scope = match scope {
+        ScopeQuery::Only(value) => Some(value.clone()),
+        ScopeQuery::All | ScopeQuery::WithGlobal(_) => None,
+    };
+    let memories = store
+        .list(&ReadOptions {
+            scope: list_scope,
+            limit: None,
+            ..options.clone()
+        })
+        .map_err(store_err)?;
+    Ok(memories
+        .into_iter()
+        .filter(|memory| scope_allows(scope, &memory.scope))
+        .filter_map(|memory| {
+            let text = haystack(&memory);
+            let found = pattern.find(&text)?;
+            Some(SearchHit {
+                memory,
+                rank: 0.0,
+                snippet: window_snippet(&text, found.start(), found.end()),
+            })
+        })
+        .collect())
+}
+
+fn scope_allows(scope: &ScopeQuery, value: &str) -> bool {
+    match scope {
+        ScopeQuery::All => true,
+        ScopeQuery::WithGlobal(wanted) => value == wanted || value == "global",
+        ScopeQuery::Only(wanted) => value == wanted,
+    }
+}
+
+fn haystack(memory: &Memory) -> String {
+    match memory.title.as_deref() {
+        Some(title) => format!("{title}\n{}", memory.content),
+        None => memory.content.clone(),
+    }
+}
+
+fn window_snippet(text: &str, start: usize, end: usize) -> String {
+    let mut from = start.saturating_sub(48);
+    while from > 0 && !text.is_char_boundary(from) {
+        from -= 1;
+    }
+    let mut to = (end + 48).min(text.len());
+    while to < text.len() && !text.is_char_boundary(to) {
+        to += 1;
+    }
+    let mut snippet = String::new();
+    if from > 0 {
+        snippet.push_str("...");
+    }
+    snippet.push_str(&text[from..to]);
+    if to < text.len() {
+        snippet.push_str("...");
+    }
+    snippet
+}
+
+fn emit_hits(json_output: bool, hits: &[SearchHit]) -> Result<(), String> {
+    if json_output {
+        let values: Vec<Value> = hits.iter().map(search_json).collect();
+        return print_json(&Value::Array(values));
+    }
+    for hit in hits {
+        let text = if hit.snippet.trim().is_empty() {
+            preview(&hit.memory)
+        } else {
+            one_line(&hit.snippet)
+        };
+        println!(
+            "{}  {}  {}  {}",
+            hit.memory.id, hit.memory.kind, hit.memory.scope, text
+        );
+    }
+    Ok(())
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn search_json(hit: &SearchHit) -> Value {
+    let mut value = memory_json(&hit.memory);
+    value["rank"] = Value::from(hit.rank);
+    value["snippet"] = Value::String(hit.snippet.clone());
+    value
 }
 
 fn open_store(db: Option<&Path>) -> Result<Store, String> {
@@ -574,7 +824,7 @@ mod tests {
             .get_subcommands()
             .map(|cmd| cmd.get_name())
             .collect();
-        for name in ["add", "get", "update", "forget", "list"] {
+        for name in ["add", "get", "update", "forget", "list", "search", "scopes"] {
             assert!(names.contains(&name), "{names:?}");
         }
     }

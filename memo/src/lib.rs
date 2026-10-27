@@ -8,6 +8,6 @@ pub mod storage;
 
 pub use error::{Error, Result};
 pub use storage::{
-    resolve_db_path, InsertResult, Memory, MemoryKind, MemoryUpdate, NewMemory, Patch, ReadOptions,
-    Store, SCHEMA_VERSION,
+    compile_fts_query, resolve_db_path, InsertResult, Memory, MemoryKind, MemoryUpdate, NewMemory,
+    Patch, ReadOptions, ScopeQuery, ScopeSummary, SearchHit, Store, SCHEMA_VERSION,
 };

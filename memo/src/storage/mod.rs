@@ -7,6 +7,9 @@
 mod markdown;
 mod migrate;
 mod path;
+mod query;
+
+pub use query::compile_fts_query;
 
 use std::fs;
 use std::path::Path;
@@ -109,15 +112,45 @@ pub struct MemoryUpdate {
     pub tags: Option<Vec<String>>,
 }
 
-/// Filters for [`Store::list`] and [`Store::search`].
+/// Filters for [`Store::list`].
+///
+/// [`Store::search`] uses `kind`, `tag`, `include_expired`, and `limit`.
+/// Search scope is [`ScopeQuery`]; `scope` on this struct is ignored there.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadOptions {
     pub scope: Option<String>,
     pub kind: Option<MemoryKind>,
     pub tag: Option<String>,
     pub include_expired: bool,
-    /// Maximum rows returned by [`Store::list`]. `None` means no limit.
+    /// Maximum rows. `None` means no limit.
     pub limit: Option<u32>,
+}
+
+/// Which scopes [`Store::search`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeQuery {
+    /// Every scope.
+    All,
+    /// `scope` plus `global`.
+    WithGlobal(String),
+    /// Exactly this scope.
+    Only(String),
+}
+
+/// One full-text hit. `rank` is the FTS5 `bm25` score; lower is a stronger match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub memory: Memory,
+    pub rank: f64,
+    pub snippet: String,
+}
+
+/// Unexpired memories in one scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSummary {
+    pub scope: String,
+    pub count: i64,
+    pub last_updated: Option<String>,
 }
 
 /// One stored memory, including its tags.
@@ -269,30 +302,119 @@ impl Store {
     /// Full-text search over indexed title, content, and tags.
     ///
     /// `query` is an FTS5 `MATCH` expression. An empty query returns no rows.
-    pub fn search(&self, query: &str, options: &ReadOptions) -> Result<Vec<Memory>> {
+    /// Expired rows are omitted unless `options.include_expired` is set.
+    /// Results are ordered by `bm25` (lower is a stronger match), then id.
+    /// Invalid FTS5 syntax is [`Error::InvalidSearch`].
+    pub fn search(
+        &self,
+        query: &str,
+        scope: &ScopeQuery,
+        options: &ReadOptions,
+    ) -> Result<Vec<SearchHit>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        let (mode, scope_value) = scope_bind(scope)?;
         let sql = "
-            SELECT m.id
+            SELECT m.id,
+                   bm25(memories_fts),
+                   snippet(memories_fts, -1, '', '', '...', 12)
             FROM memories_fts
             JOIN memories m ON m.id = memories_fts.rowid
             WHERE memories_fts MATCH ?1
               AND (?2 OR m.expires_at IS NULL OR m.expires_at > ?3)
-              AND (?4 IS NULL OR m.scope = ?4)
-              AND (?5 IS NULL OR m.kind = ?5)
               AND (
-                    ?6 IS NULL
+                    ?4 = 0
+                    OR (?4 = 1 AND (m.scope = ?5 OR m.scope = 'global'))
+                    OR (?4 = 2 AND m.scope = ?5)
+                  )
+              AND (?6 IS NULL OR m.kind = ?6)
+              AND (
+                    ?7 IS NULL
                     OR EXISTS (
                         SELECT 1
                         FROM memory_tags mt
                         JOIN tags t ON t.id = mt.tag_id
-                        WHERE mt.memory_id = m.id AND t.name = ?6
+                        WHERE mt.memory_id = m.id AND t.name = ?7
                     )
                   )
             ORDER BY bm25(memories_fts), m.id
+            LIMIT ?8
         ";
-        self.collect_memories(sql, options, Some(query))
+        let now = now_utc();
+        let kind = options.kind.map(|kind| kind.as_str().to_owned());
+        let tag = options.tag.as_deref().and_then(blank_to_none);
+        let limit = options.limit.map_or(-1, i64::from);
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut query_rows = stmt
+            .query(params![
+                query,
+                options.include_expired,
+                now,
+                mode,
+                scope_value,
+                kind,
+                tag,
+                limit
+            ])
+            .map_err(map_fts_error)?;
+        let mut rows = Vec::new();
+        loop {
+            let Some(row) = query_rows.next().map_err(map_fts_error)? else {
+                break;
+            };
+            rows.push((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ));
+        }
+        drop(query_rows);
+        drop(stmt);
+        let mut hits = Vec::with_capacity(rows.len());
+        for (id, rank, snippet) in rows {
+            if let Some(memory) = load_memory(&self.conn, id, true)? {
+                hits.push(SearchHit {
+                    memory,
+                    rank,
+                    snippet,
+                });
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Each scope that has an unexpired memory, plus `global` when it has none.
+    ///
+    /// `global` is first. Other scopes follow in name order. `count` skips
+    /// expired rows. `last_updated` is the newest `updated_at` in that scope.
+    pub fn scopes(&self) -> Result<Vec<ScopeSummary>> {
+        let now = now_utc();
+        let mut stmt = self.conn.prepare(
+            "SELECT scope, COUNT(*), MAX(updated_at)
+             FROM memories
+             WHERE expires_at IS NULL OR expires_at > ?1
+             GROUP BY scope",
+        )?;
+        let mut rows = stmt
+            .query_map(params![now], |row| {
+                Ok(ScopeSummary {
+                    scope: row.get(0)?,
+                    count: row.get(1)?,
+                    last_updated: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if !rows.iter().any(|row| row.scope == "global") {
+            rows.push(ScopeSummary {
+                scope: "global".to_owned(),
+                count: 0,
+                last_updated: None,
+            });
+        }
+        rows.sort_by(|left, right| scope_list_order(&left.scope, &right.scope));
+        Ok(rows)
     }
 
     /// Update any memory. `source_agent` is not an access check.
@@ -656,6 +778,32 @@ fn normalize_scope(scope: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
+fn scope_bind(scope: &ScopeQuery) -> Result<(i64, Option<String>)> {
+    match scope {
+        ScopeQuery::All => Ok((0, None)),
+        ScopeQuery::WithGlobal(value) => Ok((1, Some(normalize_scope(value)?))),
+        ScopeQuery::Only(value) => Ok((2, Some(normalize_scope(value)?))),
+    }
+}
+
+fn scope_list_order(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left == "global", right == "global") {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => left.cmp(right),
+    }
+}
+
+fn map_fts_error(err: rusqlite::Error) -> Error {
+    let message = err.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("fts5") || lower.contains("syntax error") {
+        Error::InvalidSearch(message)
+    } else {
+        Error::Sqlite(err)
+    }
+}
+
 fn normalize_tags(tags: &[String]) -> Vec<String> {
     let mut names: Vec<String> = tags.iter().filter_map(|tag| blank_to_none(tag)).collect();
     names.sort();
@@ -946,7 +1094,13 @@ mod tests {
                 .len(),
             2
         );
-        assert!(store.search("fact", &ReadOptions::default()).unwrap().len() == 1);
+        assert!(
+            store
+                .search("fact", &ScopeQuery::All, &ReadOptions::default())
+                .unwrap()
+                .len()
+                == 1
+        );
         assert!(store.delete(expired.memory.id).unwrap());
     }
 
@@ -1002,6 +1156,98 @@ mod tests {
         assert_eq!(created.offset().local_minus_utc(), 0);
         assert!(inserted.memory.created_at.ends_with('Z'));
         assert_eq!(inserted.memory.created_at, inserted.memory.updated_at);
+    }
+
+    #[test]
+    fn search_ranks_a_dense_match_first_and_rejects_bad_syntax() {
+        let (_dir, mut store) = open_temp();
+        let long = format!("rankingtoken {}", "paddingword ".repeat(40));
+        store.insert(&new_content(&long)).unwrap();
+        let short = store
+            .insert(&new_content("rankingtoken rankingtoken rankingtoken"))
+            .unwrap();
+        let hits = store
+            .search("rankingtoken", &ScopeQuery::All, &ReadOptions::default())
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].memory.id, short.memory.id);
+        assert!(hits[0].rank <= hits[1].rank);
+        assert!(hits[0].snippet.contains("rankingtoken"));
+
+        let err = store
+            .search("(", &ScopeQuery::All, &ReadOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidSearch(_)), "{err}");
+    }
+
+    #[test]
+    fn search_scope_modes_and_scope_counts() {
+        let (_dir, mut store) = open_temp();
+        store
+            .insert(&NewMemory {
+                content: "scopequark global copy".to_owned(),
+                scope: "global".to_owned(),
+                ..NewMemory::default()
+            })
+            .unwrap();
+        store
+            .insert(&NewMemory {
+                content: "scopequark project copy".to_owned(),
+                scope: "project".to_owned(),
+                ..NewMemory::default()
+            })
+            .unwrap();
+        store
+            .insert(&NewMemory {
+                content: "scopequark other copy".to_owned(),
+                scope: "other".to_owned(),
+                ..NewMemory::default()
+            })
+            .unwrap();
+        store
+            .insert(&NewMemory {
+                content: "scopequark expired copy".to_owned(),
+                scope: "archive".to_owned(),
+                expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+                ..NewMemory::default()
+            })
+            .unwrap();
+
+        let with_global = store
+            .search(
+                "scopequark",
+                &ScopeQuery::WithGlobal("project".to_owned()),
+                &ReadOptions::default(),
+            )
+            .unwrap();
+        let mut scopes: Vec<_> = with_global
+            .iter()
+            .map(|hit| hit.memory.scope.as_str())
+            .collect();
+        scopes.sort_unstable();
+        assert_eq!(scopes, vec!["global", "project"]);
+
+        let only = store
+            .search(
+                "scopequark",
+                &ScopeQuery::Only("project".to_owned()),
+                &ReadOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].memory.scope, "project");
+
+        let summaries = store.scopes().unwrap();
+        assert_eq!(summaries[0].scope, "global");
+        assert_eq!(summaries[0].count, 1);
+        assert!(summaries[0].last_updated.is_some());
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|row| (row.scope.as_str(), row.count))
+                .collect::<Vec<_>>(),
+            vec![("global", 1), ("other", 1), ("project", 1)]
+        );
     }
 
     fn table_names(store: &Store) -> Vec<String> {
