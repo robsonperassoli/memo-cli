@@ -20,9 +20,9 @@ Install from source, a short quickstart, and where the database file goes are in
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — release installers, install from source, and a quickstart
+- [Getting started](docs/getting-started.md) — release installers, install from source, and an end-to-end walkthrough
 - [Commands](docs/commands.md) — `add`, `get`, `update`, `forget`, `list`, `search`, `scopes`, `schema`, and `sql`, with every flag
-- [Query syntax](docs/query-syntax.md) — FTS5 terms, prefixes, `--any`, and `--regex`
+- [Query syntax](docs/query-syntax.md) — FTS5 (`AND`, `--any`, prefix, `OR` / `NOT` / phrases / `NEAR`), `--regex`, ranking, and read-only SQL
 - [Data model](docs/data-model.md) — `MEMO_DB`, `XDG_DATA_HOME`, scopes, the global scope, and the `memories` view
 - [Skill](docs/skill.md) — install the agent skill
 - [Releasing](docs/releasing.md) — tag a version and publish a GitHub Release

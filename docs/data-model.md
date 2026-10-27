@@ -95,7 +95,7 @@ WHERE memories_fts MATCH 'deploy'
 
 ## SQL access
 
-`memo sql` opens the migrated file read-only, with `PRAGMA query_only`, and denies writes. The statement cap, the 5 second cancel, and the JSON and text formats are in [Commands](commands.md).
+`memo sql` opens the migrated file read-only. The `memories` view, `memories_fts`, the read-only rule, the row cap, and the 5 second timeout are in [Query syntax](query-syntax.md). Flag and JSON details are in [Commands](commands.md).
 
 ## Later
 

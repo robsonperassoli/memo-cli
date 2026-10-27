@@ -8,24 +8,20 @@ Commands: `add`, `get`, `update`, `forget`, `list`, `search`, `scopes`, `schema`
 
 ```sh
 memo --help
-memo add --help
 memo -h
+memo help add
 memo --version
 ```
 
-`--help` prints the long help. `-h` prints the short summary. `--version` (`-V`) prints `memo 0.1.0` for this release. `memo help <command>` prints that command's help.
+`--help` prints the long help. `-h` prints the short summary. `memo help <command>` prints that command's help. `--version` (`-V`) prints `memo 0.1.0` for this release.
 
-Examples use `--db ./memo.db`. Delete that file before a section that names specific ids. On an empty database the first memory is id `1`.
+Examples use `--db ./memo.db` and do not write the default database. Each section below recreates that file. On an empty database the first memory is id `1`.
 
 ## Global options
 
-Both options are global, so they may appear before or after the subcommand.
+`--db` and `--json` are global. They may appear before or after the subcommand.
 
 `--db PATH` selects the SQLite file and overrides `MEMO_DB`. When it is omitted, memo uses `$XDG_DATA_HOME/memo/memo.db`, or `~/.local/share/memo/memo.db` if `XDG_DATA_HOME` is unset. See [Data model](data-model.md).
-
-```sh
-memo --db ./memo.db list
-```
 
 `--json` prints one JSON value instead of text. Object keys are sorted alphabetically. A memory object has these fields:
 
@@ -38,30 +34,26 @@ memo --db ./memo.db list
 | `content` | string |
 | `tags` | array of strings |
 | `source_agent` | string or `null` |
-| `created_at` | ISO-8601 UTC |
-| `updated_at` | ISO-8601 UTC |
-| `expires_at` | ISO-8601 UTC or `null` |
+| `created_at` | ISO-8601 UTC with milliseconds |
+| `updated_at` | ISO-8601 UTC with milliseconds |
+| `expires_at` | ISO-8601 UTC with milliseconds, or `null` |
 
-`memo add --json` also includes `deduplicated`. `memo search --json` adds `rank` and `snippet`. `memo list --json` and `memo scopes --json` print arrays. `memo schema --json` and `memo sql --json` are described with those commands.
+`add` also includes `deduplicated` (boolean). `search` also includes `rank` (number) and `snippet` (string). `list` prints an array of memory objects. The other commands document their own arrays below.
 
 ```sh
-memo --db ./memo.db --json add "The cache TTL is 30 seconds." \
-  --title "Cache TTL" --kind fact --scope my-project --tags cache
+rm -f ./memo.db
+memo --db ./memo.db list
 ```
 
-```json
-{"content":"The cache TTL is 30 seconds.","created_at":"2026-10-27T02:23:57.662Z","deduplicated":false,"expires_at":null,"id":1,"kind":"fact","scope":"my-project","source_agent":null,"tags":["cache"],"title":"Cache TTL","updated_at":"2026-10-27T02:23:57.662Z"}
-```
+An empty database prints no rows.
 
-The timestamps above are one run's values.
+## Exit codes
 
-## Exit status
+Success is exit `0`. Operational errors go to stderr as `memo: ...` and exit `1`. A clap usage error exits `2`.
 
-Operational errors go to stderr as `memo: ...` and exit `1`. A usage error from clap exits `2` and prints the usage to stderr. Success is `0`, including a query that reports truncation.
-
-| Situation | Exit | Message |
+| Situation | Exit | Stderr |
 | --- | --- | --- |
-| Unknown id | 1 | `memo: memory <id> not found` |
+| Unknown id, including an expired id on `get` | 1 | `memo: memory <id> not found` |
 | `update` with no change | 1 | `memo: nothing to update` |
 | `search` with no terms and no `--regex` | 1 | `memo: provide search terms or --regex` |
 | Invalid FTS5 query | 1 | `memo: invalid search query: ...` |
@@ -69,10 +61,31 @@ Operational errors go to stderr as `memo: ...` and exit `1`. A usage error from 
 | Invalid `--expires` | 1 | `memo: invalid timestamp: ...` |
 | Empty `--tag` or `--scope` | 1 | `memo: tag must not be empty` or `memo: scope must not be empty` |
 | `add` in a terminal with no body | 1 | `memo: content is required (argument, stdin, or --file)` |
-| Write SQL | 1 | `memo: SQL access is read-only` |
+| `add` body that collides on `update` | 1 | `memo: a memory with the same content already exists in scope <scope>` |
+| Write SQL, including `ATTACH` and assigning `PRAGMA` | 1 | `memo: SQL access is read-only` |
+| Empty SQL | 1 | `memo: SQL query must not be empty` |
+| More than one SQL statement | 1 | `memo: database error: Multiple statements provided` |
 | SQL longer than 5 seconds | 1 | `memo: query exceeded the 5s time limit` |
-| `--scope` with `--only-scope` | 2 | clap: the arguments cannot be used together |
-| `--file` with a positional body, or with `--content` | 2 | clap: the arguments cannot be used together |
+| SQL results past `--max-rows` | 0 | `memo: results truncated to N rows` |
+| `--scope` with `--only-scope` | 2 | the arguments cannot be used together |
+| `--file` with a positional body, or with `--content` | 2 | the arguments cannot be used together |
+
+```sh
+# expect 1
+memo --db ./memo.db get 999
+```
+
+```sh
+# expect 1
+memo --db ./memo.db update 1
+```
+
+```sh
+# expect 2
+memo --db ./memo.db search deploy --scope my-project --only-scope my-project
+```
+
+Search syntax errors and the SQL failures are in [Query syntax](query-syntax.md).
 
 ## memo add
 
@@ -82,15 +95,44 @@ memo add [CONTENT] [--file PATH] [--title TEXT] [--kind KIND] [--scope SCOPE] [-
 
 Store a memory. Markdown in the body is stored unchanged.
 
-The body is the positional `CONTENT`, stdin when `CONTENT` is `-`, stdin when `CONTENT` and `--file` are both omitted and stdin is not a terminal, or the file given by `--file`. `--file` cannot be combined with `CONTENT`. In a terminal, omitting both the argument and `--file` fails with `content is required`.
+### Flags
 
-`--kind` is `fact`, `decision`, or `note`. The default is `note`. `--scope` defaults to `global`. `--tags` is a comma-separated list; names are trimmed and empty names are dropped. `--agent` is stored as `source_agent` and is informational. `--title` is optional.
+| Flag | Meaning |
+| --- | --- |
+| `CONTENT` | Body. `-` reads stdin. Omitted when `--file` is set or when stdin is not a terminal. |
+| `--file PATH` | Read the body from a file. Cannot be combined with `CONTENT`. |
+| `--title TEXT` | Optional title. |
+| `--kind KIND` | `fact`, `decision`, or `note`. Default `note`. |
+| `--scope SCOPE` | Scope name. Default `global`. |
+| `--tags TAGS` | Comma-separated tags. Names are trimmed; empty names are dropped. |
+| `--agent NAME` | Stored as `source_agent`. Informational. |
+| `--expires DATE` | `YYYY-MM-DD` (UTC midnight) or an RFC 3339 timestamp. Stored as canonical UTC with milliseconds. |
 
-`--expires` is `YYYY-MM-DD` or an RFC 3339 timestamp. A date is UTC midnight. The stored value is canonical UTC with millisecond precision, so `2030-01-02` is stored as `2030-01-02T00:00:00.000Z` and `2030-06-01T15:30:00+02:00` as `2030-06-01T13:30:00.000Z`.
+### Input
 
-Text output is `added <id>` for a new row. The same whitespace-normalized content in the same scope returns the existing row, leaves it unchanged, and prints `deduplicated <id>`. Normalization trims the body and collapses internal whitespace; the stored markdown is not rewritten. The same body in another scope is a new row. JSON sets `"deduplicated": true` or `false`.
+The body comes from one of three places:
+
+- the positional argument
+- stdin, when the argument is `-`, or when the argument and `--file` are both omitted and stdin is not a terminal
+- `--file`
+
+In a terminal, omitting the argument and `--file` exits `1` with `memo: content is required (argument, stdin, or --file)`.
+
+### JSON
+
+One memory object plus `deduplicated`. A new row is `"deduplicated": false`. Text output is `added <id>`.
+
+The same whitespace-normalized content in the same scope returns the existing row, does not change it, prints `deduplicated <id>`, and sets `"deduplicated": true`. Normalization trims the body and collapses internal whitespace. The stored markdown is not rewritten. The same body in another scope is a new row.
+
+### Exit codes
+
+Exit `1` for a missing body in a terminal, an invalid `--expires`, or an unreadable `--file`. Exit `2` when `--file` is combined with `CONTENT`. A duplicate body on `add` is exit `0`.
+
+### Examples
 
 ```sh
+rm -f ./memo.db notes.md
+
 memo --db ./memo.db add "Production deploys go through the staging gate." \
   --title "Deploy gate" \
   --kind decision \
@@ -98,29 +140,37 @@ memo --db ./memo.db add "Production deploys go through the staging gate." \
   --tags deploy,process \
   --agent planner \
   --expires 2030-01-02
-```
 
-```
-added 1
-```
-
-Read stdin explicitly, or from a pipe when no body argument is given:
-
-```sh
 memo --db ./memo.db add - --title "Rollback gotcha" --kind note --scope my-project <<'EOF'
 Redeploy the previous image.
 EOF
 
 printf 'Piped body.\n' | memo --db ./memo.db add --title "From a pipe" --scope my-project
+
+printf 'File body.\n' > notes.md
+memo --db ./memo.db add --file notes.md --title "API conventions" --kind fact --scope my-project --tags api
+
+memo --db ./memo.db add "Production deploys go through the staging gate." --scope my-project
+
+memo --db ./memo.db add "offset expiry" --expires 2030-06-01T15:30:00+02:00
+
+memo --db ./memo.db --json sql "SELECT id, expires_at FROM memories WHERE id = 1 OR content = 'offset expiry' ORDER BY id"
 ```
 
-Read a file:
+The first add prints `added 1`. The repeated staging-gate sentence prints `deduplicated 1`. The expiry query prints:
+
+```json
+[{"expires_at":"2030-01-02T00:00:00.000Z","id":1},{"expires_at":"2030-06-01T13:30:00.000Z","id":5}]
+```
+
+`2030-01-02` is UTC midnight. `2030-06-01T15:30:00+02:00` is stored as `2030-06-01T13:30:00.000Z`. JSON keys are sorted, so `expires_at` comes before `id`.
 
 ```sh
-memo --db ./memo.db add --file notes.md --title "API conventions" --kind fact --scope my-project --tags api
+memo --db ./memo.db --json add "The cache TTL is 30 seconds." \
+  --title "Cache TTL" --kind fact --scope my-project --tags cache
 ```
 
-Inserting the staging-gate sentence again in `my-project` prints `deduplicated 1`.
+The object contains the memory fields and `"deduplicated": false`. `created_at` and `updated_at` are the insert time.
 
 ## memo get
 
@@ -128,11 +178,24 @@ Inserting the staging-gate sentence again in `my-project` prints `deduplicated 1
 memo get <ID>
 ```
 
-Print one memory that has not expired. Text prints the fields, a blank line, and the content. A missing title, tag list, `source_agent`, or `expires_at` is `-`. JSON prints one memory object.
+### Flags
 
-An unknown id and an expired id both fail with `memo: memory <id> not found`.
+`ID` is the memory id. Global `--db` and `--json` apply. There are no other flags.
+
+### JSON
+
+One memory object. Text prints `id`, `scope`, `kind`, `title`, `tags`, `source_agent`, `created_at`, `updated_at`, and `expires_at`, then a blank line and the content. A missing title, tag list, `source_agent`, or `expires_at` is `-`. Tags in text are comma-separated.
+
+### Exit codes
+
+An unknown id and an expired id both exit `1` with `memo: memory <id> not found`.
+
+### Examples
 
 ```sh
+rm -f ./memo.db
+memo --db ./memo.db add "Production deploys go through the staging gate." \
+  --title "Deploy gate" --kind decision --scope my-project --tags deploy,process
 memo --db ./memo.db get 1
 memo --db ./memo.db --json get 1
 ```
@@ -143,13 +206,41 @@ memo --db ./memo.db --json get 1
 memo update <ID> [--content CONTENT] [--file PATH] [--title TEXT] [--kind KIND] [--scope SCOPE] [--add-tag TAG] [--remove-tag TAG] [--expires DATE]
 ```
 
-Change the given fields, set `updated_at`, and refresh the full-text index. At least one change is required. Unlike `add`, a pipe is not read unless `--content -` or `--file` is set.
+Change the given fields, set `updated_at`, and refresh the full-text index. At least one change is required.
 
-`--content` replaces the body. `-` reads stdin. `--file` reads the replacement body from a file and cannot be combined with `--content`. `--title` replaces the title; an empty value clears it. `--kind` and `--scope` replace those fields. `--add-tag` and `--remove-tag` may be repeated. Tag names are trimmed; an empty name is ignored; adding a tag that is already present does not duplicate it. `--expires` sets a new expiry using the same date and RFC 3339 forms as `add`. There is no flag that clears `expires_at`.
+### Flags
 
-Text output is `updated <id>`. JSON prints the updated memory object. An unknown id is not found. Update and forget still accept an expired id. Changing the body or the scope to match another row's normalized content in the destination scope fails with `memo: a memory with the same content already exists in scope <scope>`.
+| Flag | Meaning |
+| --- | --- |
+| `ID` | Memory id. Expired ids are accepted. |
+| `--content CONTENT` | Replacement body. `-` reads stdin. Cannot be combined with `--file`. |
+| `--file PATH` | Read the replacement body from a file. |
+| `--title TEXT` | Replacement title. An empty value clears it (`null` in JSON, `-` in text). |
+| `--kind KIND` | `fact`, `decision`, or `note`. |
+| `--scope SCOPE` | Replacement scope. |
+| `--add-tag TAG` | Tag to add. May be repeated. Empty names are ignored. A tag already present is not duplicated. |
+| `--remove-tag TAG` | Tag to remove. May be repeated. |
+| `--expires DATE` | Replacement expiry, same forms as `add`. Nothing clears `expires_at`. |
+
+### Input
+
+Unlike `add`, a pipe is not the body unless `--content -` or `--file` is set.
+
+### JSON
+
+One memory object for the updated row. Text output is `updated <id>`.
+
+### Exit codes
+
+Exit `1` when no flag changes anything (`memo: nothing to update`), the id does not exist, `--expires` is invalid, or the new body and scope collide with a different row (`memo: a memory with the same content already exists in scope <scope>`). Exit `2` when `--content` and `--file` are both set.
+
+### Examples
 
 ```sh
+rm -f ./memo.db notes.md
+memo --db ./memo.db add "Production deploys go through the staging gate." \
+  --title "Deploy gate" --kind decision --scope my-project --tags deploy,process
+
 memo --db ./memo.db update 1 \
   --content "The cache TTL is 60 seconds." \
   --title "Cache TTL" \
@@ -165,7 +256,10 @@ printf 'Replaced from a file.\n' > notes.md
 memo --db ./memo.db update 1 --file notes.md
 
 memo --db ./memo.db update 1 --title ""
+memo --db ./memo.db --json update 1 --add-tag extra
 ```
+
+Each text update prints `updated 1`. The last command prints the memory object. `title` is `null` because the previous update cleared it.
 
 ## memo forget
 
@@ -173,19 +267,29 @@ memo --db ./memo.db update 1 --title ""
 memo forget <ID>
 ```
 
-Delete a memory, including an expired one. Text output is `forgot <id>`. JSON prints the deleted memory object. An unknown id is not found. A later `get` of that id is not found.
+### Flags
 
-Text prints `forgot 1`:
+`ID` is the memory id. Expired ids are accepted. Global `--db` and `--json` apply.
+
+### JSON
+
+The deleted memory object. Text output is `forgot <id>`.
+
+### Exit codes
+
+An unknown id exits `1` with `memo: memory <id> not found`. A later `get` of that id is the same error.
+
+### Examples
 
 ```sh
-memo --db ./memo.db forget 1
-```
-
-JSON prints the deleted memory object. This is the same deletion, not a second one:
-
-```sh
+rm -f ./memo.db
+memo --db ./memo.db add "keep until the json example"
+memo --db ./memo.db add "drop this row"
+memo --db ./memo.db forget 2
 memo --db ./memo.db --json forget 1
 ```
+
+`forget 2` prints `forgot 2`. The JSON command prints the object for id `1` and deletes it.
 
 ## memo list
 
@@ -193,17 +297,42 @@ memo --db ./memo.db --json forget 1
 memo list [--tag TAG] [--scope SCOPE] [--kind KIND] [--limit N]
 ```
 
-List unexpired memories, newest first. `--scope` is an exact scope match and does not add `global`. `--tag` and `--kind` (`fact`, `decision`, or `note`) filter further. `--limit` caps the number of rows. The flags combine.
+List unexpired memories, newest first.
 
-Each text line is the id, kind, scope, and a preview, separated by two spaces. The preview is the title when the title is set, otherwise the content. Whitespace collapses to single spaces, and the preview is cut at 72 characters with `...`. JSON is an array of memory objects with the full body. Expired rows are omitted.
+### Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--tag TAG` | Only memories with this tag. |
+| `--scope SCOPE` | Exact scope match. Does not add `global`. |
+| `--kind KIND` | `fact`, `decision`, or `note`. |
+| `--limit N` | Maximum number of rows. |
+
+The filters combine.
+
+### JSON
+
+An array of memory objects, full body included. Text lines are `id`, `kind`, `scope`, and a preview, separated by two spaces. The preview is the title when one is set, otherwise the content. Whitespace collapses to single spaces. The preview is cut at 72 characters with `...`.
+
+### Exit codes
+
+Exit `1` when `--tag` or `--scope` is empty or only whitespace. An empty result is exit `0` and prints nothing.
+
+### Examples
 
 ```sh
+rm -f ./memo.db
+memo --db ./memo.db add "The deploy window is weekdays." --title "Deploy window" --kind fact
+memo --db ./memo.db add "Production deploys go through the staging gate." \
+  --title "Deploy gate" --kind decision --scope my-project --tags deploy,process
+
 memo --db ./memo.db list
 memo --db ./memo.db list --scope my-project --kind decision --tag deploy --limit 20
-memo --db ./memo.db --json list --scope global
+memo --db ./memo.db list --scope global
+memo --db ./memo.db --json list --scope global --limit 1
 ```
 
-`list --scope global` does not include `my-project`. An empty database still opens the file and prints nothing. `memo scopes` on that file prints `global  0  -`.
+`list` prints id `2` and then id `1`. `--scope my-project` prints only id `2`. `--scope global` prints only id `1`. JSON prints a one-element array.
 
 ## memo search
 
@@ -211,25 +340,49 @@ memo --db ./memo.db --json list --scope global
 memo search [TERM]... [--scope SCOPE | --only-scope SCOPE] [--any] [--regex PATTERN] [--kind KIND] [--tag TAG] [--limit N]
 ```
 
-Search indexed title, content, and tags. Expired rows are omitted. How terms, prefixes, `--any`, raw FTS5, and `--regex` are compiled is in [Query syntax](query-syntax.md).
+Search indexed title, content, and tags. How terms are compiled is in [Query syntax](query-syntax.md).
 
-`--scope SCOPE` searches that scope and `global`. `--only-scope SCOPE` searches that scope alone. Omitting both searches every scope. The two flags cannot be combined (exit 2). `--kind` and `--tag` restrict matches. `--limit` caps the rows. With terms and no `--regex`, the limit is applied to the ranked results. With `--regex`, filters run before the limit.
+### Flags
 
-At least one `TERM` or `--regex` is required.
+| Flag | Meaning |
+| --- | --- |
+| `TERM` | Keyword or raw FTS5. Repeatable. A trailing `*` is a prefix. |
+| `--scope SCOPE` | This scope plus `global`. |
+| `--only-scope SCOPE` | Only this scope. Cannot be combined with `--scope`. |
+| `--any` | Join plain terms with `OR` instead of `AND`. |
+| `--regex PATTERN` | Rust regular expression over title and content. |
+| `--kind KIND` | `fact`, `decision`, or `note`. |
+| `--tag TAG` | Only memories with this tag. |
+| `--limit N` | Maximum number of rows. |
 
-Each text line is the id, kind, scope, and a one-line snippet. JSON rows are memory objects plus `rank` and `snippet`. FTS5 `bm25` rank is lower for a stronger match. Regex-only hits use rank `0`, are ordered newest first, and take the snippet from the title and content around the match. Text output collapses whitespace in the snippet; the JSON `snippet` keeps newlines.
+At least one `TERM` or `--regex` is required. Expired rows are omitted.
+
+### JSON
+
+An array of memory objects plus `rank` and `snippet`. FTS5 `bm25`: a lower `rank` is a stronger match. Regex-only hits use rank `0`. Text lines are `id`, `kind`, `scope`, and a one-line snippet. JSON `snippet` keeps newlines; text collapses them.
+
+### Exit codes
+
+Exit `1` when no terms and no `--regex` are given, the FTS5 query is invalid, or `--regex` is invalid. Exit `2` when `--scope` and `--only-scope` are both set. An empty match list is exit `0`.
+
+### Examples
 
 ```sh
-memo --db ./memo.db search deploy rollback
-memo --db ./memo.db search deploy rollback --any
+rm -f ./memo.db
+memo --db ./memo.db add "The deploy window is weekdays." --title "Deploy window" --kind fact
+memo --db ./memo.db add "Production deploys go through the staging gate." \
+  --title "Deploy gate" --kind decision --scope my-project --tags deploy,process
+
+memo --db ./memo.db search deploy gate
+memo --db ./memo.db search window gate --any
 memo --db ./memo.db search deploy --scope my-project
 memo --db ./memo.db search deploy --only-scope my-project
 memo --db ./memo.db search 'deploy*'
-memo --db ./memo.db search --regex 'TTL is [0-9]+' --kind fact --tag cache --limit 10
+memo --db ./memo.db search --regex 'staging' --kind decision --tag deploy --limit 10
 memo --db ./memo.db --json search deploy --scope my-project --limit 5
 ```
 
-On the [quickstart](getting-started.md) database, `search deploy --scope my-project` prints both rows, and `search deploy --only-scope my-project` prints only id `2`.
+`search deploy gate` prints only id `2`. `--any` prints both. `--scope my-project` prints both. `--only-scope my-project` prints id `2`. The JSON command prints an array whose objects include `rank` and `snippet`.
 
 ## memo scopes
 
@@ -237,22 +390,37 @@ On the [quickstart](getting-started.md) database, `search deploy --scope my-proj
 memo scopes
 ```
 
-List every scope that has unexpired memories, plus `global` even when it has none. Each row has the scope name, the count of unexpired memories, and the latest `updated_at`. `global` is first, then the other scopes by name. A scope with no unexpired rows shows `-` for the time.
+### Flags
 
-JSON is an array of objects with `scope`, `count`, and `last_updated` (`null` when there are no unexpired memories). Keys are sorted, so the fields appear as `count`, `last_updated`, `scope`.
+No flags beyond global `--db` and `--json`.
+
+### JSON
+
+An array of objects with `count` (number), `last_updated` (string or `null`), and `scope` (string). Keys are sorted, so they appear in that order. Text lines are the scope, the count of unexpired memories, and the latest `updated_at`, or `-` when the count is 0. `global` is always listed, first, then other scopes by name.
+
+### Exit codes
+
+Exit `0` even when the only row is `global` with count `0`.
+
+### Examples
 
 ```sh
+rm -f ./memo.db
 memo --db ./memo.db scopes
-memo --db ./memo.db --json scopes
 ```
-
-An empty database prints:
 
 ```
 global  0  -
 ```
 
-How `global` interacts with `add`, `list`, and `search` is in [Data model](data-model.md).
+```sh
+memo --db ./memo.db add "Production deploys go through the staging gate." \
+  --title "Deploy gate" --kind decision --scope my-project --tags deploy
+memo --db ./memo.db scopes
+memo --db ./memo.db --json scopes
+```
+
+Text lists `global` with count `0`, then `my-project` with count `1` and its `updated_at`. JSON is a two-element array.
 
 ## memo schema
 
@@ -260,9 +428,22 @@ How `global` interacts with `add`, `list`, and `search` is in [Data model](data-
 memo schema
 ```
 
-Show the objects `memo sql` should query: the `memories` view and the `memories_fts` table. Text prints the name, the kind (`view` or `table`), a one-line description, and each column's description. JSON is an array of objects with `name`, `type`, `description`, and `columns`. Each column has `name`, `type`, and `description`. Those object keys are sorted alphabetically. Column order inside `columns` follows the schema.
+### Flags
+
+No flags beyond global `--db` and `--json`.
+
+### JSON
+
+An array of objects with `columns`, `description`, `name`, and `type` (`view` or `table`). Each column has `description`, `name`, and `type`. Those keys are sorted. Column order inside `columns` follows the schema. Text prints the name, the kind, the description, and each column description.
+
+### Exit codes
+
+Exit `0` after the database is created.
+
+### Examples
 
 ```sh
+rm -f ./memo.db
 memo --db ./memo.db schema
 memo --db ./memo.db --json schema
 ```
@@ -294,44 +475,30 @@ Full-text index. MATCH this table and join rowid to memories.id.
 memo sql <QUERY> [--max-rows N]
 ```
 
-Run one read-only statement against the database. The file is migrated first if needed, then opened with `SQLITE_OPEN_READ_ONLY` and `PRAGMA query_only`. A statement that writes, including `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ATTACH`, and a `PRAGMA` that assigns a value, fails with `memo: SQL access is read-only`. A read-only `PRAGMA` is allowed (`PRAGMA user_version` prints `2` on a current database).
+Run one read-only statement. The `memories` view, `memories_fts`, the read-only rule, the row cap, and the timeout are in [Query syntax](query-syntax.md).
 
-More than one statement fails with `memo: database error: Multiple statements provided`. An empty query fails with `memo: SQL query must not be empty`.
+### Flags
 
-`--max-rows` defaults to `1000`. When another row exists past the cap, memo keeps the first N rows, prints `memo: results truncated to N rows` on stderr, and exits `0`. A query that runs longer than 5 seconds is cancelled with `memo: query exceeded the 5s time limit`.
+| Flag | Meaning |
+| --- | --- |
+| `QUERY` | One SQL statement. Writes are rejected. |
+| `--max-rows N` | Maximum number of rows. Default `1000`. |
 
-Text output is a table. Columns are padded and separated by two spaces. `NULL` is blank, newlines in text collapse to spaces, and a blob is `<N bytes>`. JSON is an array of objects, one per row, keyed by column name. Keys are sorted alphabetically, so they can differ from the `SELECT` order. `memories.tags` stays a JSON array encoded as text, not a nested JSON array.
+### JSON
 
-The `memories` view includes expired rows. `memo list` and `memo search` hide those rows; a SQL query does not, unless the statement filters `expires_at`. `content_hash` is not a column of the view. It lives on the internal `memory_rows` table.
+An array of row objects keyed by column name. Keys are sorted alphabetically, so they can differ from the `SELECT` list. `NULL` is `null`. Text output pads columns with two spaces between them. `NULL` is blank, newlines collapse to spaces, and a blob is `<N bytes>`. `memories.tags` stays a JSON array encoded as text, not a nested array.
+
+### Exit codes
+
+Exit `1` for an empty query, a write, more than one statement, or a query cancelled after 5 seconds. Exit `0` when results are truncated; the notice is on stderr.
+
+### Examples
 
 ```sh
-memo --db ./memo.db schema
-
-memo --db ./memo.db sql \
-  "SELECT id, title, scope, tags FROM memories WHERE scope = 'my-project' ORDER BY id"
-
-memo --db ./memo.db --json sql \
-  "SELECT id, tags FROM memories WHERE id = 1"
-
-memo --db ./memo.db sql \
-  "SELECT memories.id, memories.title
-   FROM memories
-   JOIN memories_fts ON memories_fts.rowid = memories.id
-   WHERE memories_fts MATCH 'deploy'
-   ORDER BY memories.id"
-
-memo --db ./memo.db sql \
-  "SELECT id, title FROM memories
-   WHERE expires_at IS NULL OR expires_at > '2026-10-27T00:00:00.000Z'
-   ORDER BY id"
-
-memo --db ./memo.db sql "SELECT n FROM (
-  WITH RECURSIVE c(n) AS (
-    SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 30
-  ) SELECT n FROM c
-)" --max-rows 2
+rm -f ./memo.db
+memo --db ./memo.db add "The deploy window is weekdays." --title "Deploy window" --kind fact
+memo --db ./memo.db sql "SELECT id, title FROM memories"
+memo --db ./memo.db --json sql "SELECT title, id FROM memories"
 ```
 
-The last command prints two rows and, on stderr, `memo: results truncated to 2 rows`.
-
-`SELECT title, id` is returned in JSON as `{"id":1,"title":"..."}` because the keys are sorted. The column descriptions and the rest of the storage rules are in [Data model](data-model.md).
+The JSON row is `{"id":1,"title":"Deploy window"}`. `id` is first because the keys are sorted.

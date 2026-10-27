@@ -22,6 +22,8 @@ Each release also publishes an archive per target, a `.sha256` file per archive,
 memo --version
 ```
 
+`memo --version` prints `memo 0.1.0` for this release.
+
 ## Install from source
 
 The repository is a Cargo workspace. The package is `memo/` and the binary is `memo`. `rust-toolchain.toml` selects the stable channel.
@@ -39,69 +41,50 @@ cargo build --release
 ./target/release/memo --version
 ```
 
-## Quickstart
+## Walkthrough
 
-Examples in this page use `--db ./memo.db`, so they do not write the default database. Delete `./memo.db` first when you want the ids below. On an empty database the first memory is id `1`.
-
-`--scope` defaults to `global`. This stores one global fact and one project decision:
+One database, from the first write through search, update, SQL, and delete. The file is `./memo.db`, so this does not touch the default database. Delete it first. On an empty database the first memory is id `1`. `--scope` defaults to `global`.
 
 ```sh
+rm -f ./memo.db
+
 memo --db ./memo.db add "The deploy window is weekdays." \
   --title "Deploy window" --kind fact
 
 memo --db ./memo.db add "Production deploys go through the staging gate." \
   --title "Deploy gate" --kind decision --scope my-project --tags deploy,process
-```
 
-```
-added 1
-added 2
-```
-
-List is newest first. Each line is id, kind, scope, and title:
-
-```sh
 memo --db ./memo.db list
-```
 
-```
-2  decision  my-project  Deploy gate
-1  fact  global  Deploy window
-```
-
-`search --scope` includes that scope and `global`:
-
-```sh
 memo --db ./memo.db search deploy --scope my-project
-```
 
-```
-1  fact  global  Deploy window
-2  decision  my-project  Deploy gate
-```
-
-Print one memory:
-
-```sh
 memo --db ./memo.db get 2
+
+memo --db ./memo.db update 2 \
+  --content "Production deploys go through staging, then production."
+
+memo --db ./memo.db sql "SELECT id, scope, title FROM memories ORDER BY id"
+
+memo --db ./memo.db forget 1
+
+memo --db ./memo.db scopes
 ```
 
-```
-id: 2
-scope: my-project
-kind: decision
-title: Deploy gate
-tags: deploy, process
-source_agent: -
-created_at: 2026-10-27T02:24:46.230Z
-updated_at: 2026-10-27T02:24:46.230Z
-expires_at: -
+The two adds print `added 1` and `added 2`. `list` is newest first:
 
-Production deploys go through the staging gate.
+```
+2  decision  my-project  Deploy gate
+1  fact  global  Deploy window
 ```
 
-`created_at` and `updated_at` are the time of the insert. The remaining commands, flags, and JSON shapes are in [Commands](commands.md).
+`search --scope my-project` includes that scope and `global`, so both rows match `deploy`. `get 2` prints the fields (`id`, `scope`, `kind`, `title`, `tags`, `source_agent`, `created_at`, `updated_at`, `expires_at`) and then the body. `update` prints `updated 2`. The SQL statement reads the `memories` view, including the new body stored under the same title:
 
-## Where the file is
+```
+id  scope       title
+1   global      Deploy window
+2   my-project  Deploy gate
+```
 
-Without `--db`, memo opens `$XDG_DATA_HOME/memo/memo.db`, or `~/.local/share/memo/memo.db` when `XDG_DATA_HOME` is unset. `MEMO_DB` overrides that path. Precedence and the schema are in [Data model](data-model.md). The file and its parent directories are created the first time a command opens the database.
+`forget 1` prints `forgot 1`. `scopes` still lists `global` with count `0`, then `my-project` with the remaining memory.
+
+Commands and flags are in [Commands](commands.md). Search syntax and `memo sql` are in [Query syntax](query-syntax.md). The default database path is in [Data model](data-model.md).
